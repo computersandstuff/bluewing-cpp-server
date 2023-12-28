@@ -4,7 +4,6 @@
  *
  * This example server file is available unlicensed; the MIT license of liblacewing/Lacewing Relay does not apply to this file.
 */
-
 #include <iostream>
 #include <ctime>
 #include <sstream>
@@ -16,8 +15,33 @@
 #include <termios.h>
 #include <unistd.h>
 
-using namespace std::string_view_literals;
 
+#include <iomanip>
+#include <cstdlib>
+#include <config/libconfig.h++>
+
+#include <cstdint>
+#include <bsoncxx/json.hpp>
+#include <mongocxx/client.hpp>
+#include <mongocxx/stdx.hpp>
+#include <mongocxx/uri.hpp>
+#include <mongocxx/instance.hpp>
+#include <bsoncxx/builder/stream/helpers.hpp>
+#include <bsoncxx/builder/stream/document.hpp>
+#include <bsoncxx/builder/stream/array.hpp>
+
+
+using bsoncxx::builder::stream::close_array;
+using bsoncxx::builder::stream::close_document;
+using bsoncxx::builder::stream::document;
+using bsoncxx::builder::stream::finalize;
+using bsoncxx::builder::stream::open_array;
+using bsoncxx::builder::stream::open_document;
+mongocxx::instance instance{};// don't put inside main
+
+
+using namespace std::string_view_literals;
+using namespace libconfig;
 
 // Define if you want Flash hosted. Policy file will automatically be generated.
 #define FLASH_ENABLED
@@ -39,21 +63,21 @@ static const int FIXEDPORT = 6121;
 // Set this to 0 for the app to disable websocket on either or both http/https variants.
 // websocketSecure will not work without certificate loading before websocket host is called.
 // WebSocket expects ./fullchain.pem and ./privkey.pem files, with no password, in same folder as executable.
-static int websocketNonSecure = 80, websocketSecure = 443;
+static int websocketNonSecure = 8087, websocketSecure = 4437;
 
 
 
 // Declarations - Lacewing handlers
-void OnConnectRequest(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> client);
-void OnDisconnect(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> client);
+void OnConnectRequest(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> client);
+void OnDisconnect(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> client);
 void OnTimerTick(lacewing::timer timer);
-void OnError(lacewing::relayserver &server, lacewing::error error);
-void OnServerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnError(lacewing::relayserver& server, lacewing::error error);
+void OnServerMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant);
-void OnChannelMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnChannelMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	std::shared_ptr<lacewing::relayserver::channel> channel,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant);
-void OnPeerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnPeerMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	std::shared_ptr<lacewing::relayserver::channel> viachannel, std::shared_ptr<lacewing::relayserver::client> receiverclient,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant);
 
@@ -66,7 +90,7 @@ void CloseHandler(int sig);
 // Global variables
 lacewing::eventpump globalpump;
 lacewing::timer globalmsgrecvcounttimer;
-lacewing::relayserver * globalserver;
+lacewing::relayserver* globalserver;
 std::string flashpolicypath;
 bool deleteFlashPolicyAtEndOfApp;
 static char timeBuffer[10];
@@ -115,11 +139,46 @@ static std::vector<std::shared_ptr<clientstats>> clientdata;
 
 static termios oldt;
 
-const char * sslPathCertChain = "./fullchain.pem";
-const char * sslPathPrivKey = "./privkey.pem";
+const char* sslPathCertChain = "./fullchain.pem";
+const char* sslPathPrivKey = "./privkey.pem";
 
 int main()
 {
+	//Read configuration file
+	Config cfg;
+
+	try {
+		cfg.readFile("/etc/example.cfg");
+	}
+	catch (const FileIOException& fioex) {
+		std::cerr << "I/O error while reading file." << std::endl;
+		return EXIT_FAILURE;
+	}
+	catch (const ParseException& pex) {
+		std::cerr << "Parse error at " << pex.getFile() << ":" << pex.getLine()
+			<< " - " << pex.getError() << std::endl;
+		return EXIT_FAILURE;
+	}
+
+	// Extract and print the 'port' value
+	try {
+		int port = cfg.lookup("port");
+		std::cout << "Port: " << port << std::endl;
+	}
+	catch (const SettingNotFoundException& nfex) {
+		std::cerr << "No 'port' setting in configuration file." << std::endl;
+	}
+
+	//mongocxx::instance instance{}; // This should be done only once.
+	mongocxx::uri uri("mongodb://10.0.0.30:27017");
+	mongocxx::client client(uri);
+	mongocxx::database db = client["mydb"];
+	mongocxx::collection coll = db["mycollection"];
+
+	bsoncxx::builder::stream::document document{};
+	document << "Data" << "hello";
+	coll.insert_one(document.view());
+
 	// Disable console input
 	if (tcgetattr(STDIN_FILENO, &oldt) == -1)
 	{
@@ -159,16 +218,16 @@ int main()
 
 	{
 		char message[256];
-	#ifdef _DEBUG
+#ifdef _DEBUG
 		sprintf(message, "This is a Bluewing Server build %i. Currently under debug testing. "
 			"You may be disconnected randomly as server is restarted.", lacewing::relayserver::buildnum);
-	#elif TCP_CLIENT_UPLOAD_CAP
+#elif TCP_CLIENT_UPLOAD_CAP
 		sprintf(message, "This is a Bluewing Server build %i. An upload cap is in place. Please pay "
 			"attention to Sent server -> peer text messages on subchannels 0 and 1, or you may be banned.",
 			lacewing::relayserver::buildnum);
-	#else
+#else
 		sprintf(message, "This is a Bluewing Server build %i.", lacewing::relayserver::buildnum);
-	#endif
+#endif
 		globalserver->setwelcomemessage(message);
 	}
 
@@ -270,7 +329,7 @@ int main()
 	if (error)
 		std::cout << red << "\r\n"sv << timeBuffer << " | Error occurred in pump: "sv << error->tostring() << "\r\n"sv;
 
-	cleanup:
+cleanup:
 	// Cleanup time
 	clientdata.clear();
 	lacewing::timer_delete(globalmsgrecvcounttimer);
@@ -329,12 +388,12 @@ void UpdateTitle(size_t clientCount)
 		maxChannels = channelCount;
 }
 
-void OnConnectRequest(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> client)
+void OnConnectRequest(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> client)
 {
 	char addr[64];
 	lw_addr_prettystring(client->getaddress().data(), addr, sizeof(addr));
 
-	auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry &b) { return b.ip == addr; });
+	auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry& b) { return b.ip == addr; });
 	if (banEntry != banIPList.end())
 	{
 		if (banEntry->resetAt < time(NULL))
@@ -357,14 +416,14 @@ void OnConnectRequest(lacewing::relayserver &server, std::shared_ptr<lacewing::r
 		<< std::string(45, ' ') << "\r\n"sv << yellow;
 	clientdata.push_back(std::make_unique<clientstats>(client));
 }
-void OnDisconnect(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> client)
+void OnDisconnect(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> client)
 {
 	UpdateTitle(server.clientcount());
 	std::string name = client->name();
 	name = !name.empty() ? name : "[unset]"sv;
 	char addr[64];
 	lw_addr_prettystring(client->getaddress().data(), addr, sizeof(addr));
-	const auto a = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto &c) {
+	const auto a = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto& c) {
 		return c->c == client; }
 	);
 
@@ -379,7 +438,7 @@ void OnDisconnect(lacewing::relayserver &server, std::shared_ptr<lacewing::relay
 		clientdata.erase(a);
 	if (!client->istrusted())
 	{
-		auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry & b) { return b.ip == addr; });
+		auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry& b) { return b.ip == addr; });
 		if (banEntry == banIPList.end())
 		{
 			std::cout << yellow << '\r' << timeBuffer << " | Due to malformed protocol usage, created a IP ban entry."sv << std::string(25, ' ')
@@ -399,7 +458,7 @@ void OnTimerTick(lacewing::timer timer)
 {
 	std::time_t rawtime = std::time(NULL);
 	std::time(&rawtime);
-	std::tm * timeinfo = localtime(&rawtime);
+	std::tm* timeinfo = localtime(&rawtime);
 	if (timeinfo)
 		std::strftime(timeBuffer, sizeof(timeBuffer), "%T", timeinfo);
 	else
@@ -439,10 +498,10 @@ void OnTimerTick(lacewing::timer timer)
 		if (!c->exceeded)
 			continue;
 		char addr[64];
-		const char * ipAddress = c->c->getaddress().data();
+		const char* ipAddress = c->c->getaddress().data();
 		lw_addr_prettystring(ipAddress, addr, sizeof(addr));
 
-		auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry &b) { return b.ip == addr; });
+		auto banEntry = std::find_if(banIPList.begin(), banIPList.end(), [&](const BanEntry& b) { return b.ip == addr; });
 		if (banEntry == banIPList.end())
 			banIPList.push_back(BanEntry(ipAddress, 1, "You have been banned for heavy TCP usage. Contact Phi on Clickteam Discord.", time(NULL) + 60));
 		else
@@ -458,7 +517,7 @@ void OnTimerTick(lacewing::timer timer)
 		// If it does call the handler, the handler will delete the clientdata "c", so this for loop running through clientdata
 		// is now invalid, so we have to break or we get exception from invalid iterator.
 		// If it doesn't call the handler, we need to erase "c" or we'll get a disconnect re-attempted every timer tick.
-		const auto a = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto & cd) {
+		const auto a = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto& cd) {
 			return cd->c == c->c; }
 		);
 		if (a != clientdata.cend())
@@ -478,7 +537,7 @@ void Shutdown()
 
 	globalpump->post_eventloop_exit(); // end main loop
 }
-void OnError(lacewing::relayserver &server, lacewing::error error)
+void OnError(lacewing::relayserver& server, lacewing::error error)
 {
 	std::string_view err = error->tostring();
 	if (err.back() == '.')
@@ -487,19 +546,19 @@ void OnError(lacewing::relayserver &server, lacewing::error error)
 		<< std::string(25, ' ') << "\r\n"sv << yellow;
 }
 
-void OnServerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnServerMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant)
 {
 	++numMessagesIn;
 	bytesIn += data.size();
 
-	if (blasted || variant != 0 || subchannel != 0)
+	if (blasted || variant != 0 || subchannel != 0 && subchannel != 5)
 	{
 		char addr[64];
 		lw_addr_prettystring(senderclient->getaddress().data(), addr, sizeof(addr));
 		std::cout << red << '\r' << timeBuffer << " | Dropped server message from IP "sv << addr << ", invalid type."sv
 			<< std::string(35, ' ') << "\r\n"sv << yellow;
-		const auto cd = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto &b) { return b->c == senderclient; });
+		const auto cd = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto& b) { return b->c == senderclient; });
 		if (cd != clientdata.end())
 		{
 			(**cd).totalBytesIn += data.size();
@@ -524,10 +583,34 @@ void OnServerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::re
 	std::cout << white << '\r' << timeBuffer << " | Message from client ID "sv << senderclient->id() << ", name "sv << name
 		<< ":"sv << std::string(35, ' ') << "\r\n"sv
 		<< data << "\r\n"sv << yellow;
+	if (subchannel == 5)
+	{
+		//std::string cars[4] = { "Volvo", "BMW", "Ford", "Mazda" };
+		//std::cout << cars[0];
+
+		// { "foo" : [ 1, 2, 3 ] }
+
+		using bsoncxx::builder::basic::kvp;
+		using bsoncxx::builder::basic::sub_array;
+
+		const auto elements = { 1, 2, 3 };
+		auto doc = bsoncxx::builder::basic::document{};
+		doc.append(kvp("foo", [&elements](sub_array child) {
+			for (const auto& element : elements) {
+				child.append(element);
+			}
+			}));
+		std::cout << bsoncxx::to_json(doc) << std::endl;
+
+	}
+	if (data == "HI")
+	{
+		std::cout << "LOL IT WORKED\n";
+	}
 }
 bool IncrementClient(std::shared_ptr<lacewing::relayserver::client> client, size_t size, bool blasted)
 {
-	const auto cd = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto &b) { return b->c == client; });
+	const auto cd = std::find_if(clientdata.cbegin(), clientdata.cend(), [&](const auto& b) { return b->c == client; });
 	if (cd != clientdata.cend())
 	{
 		(**cd).totalBytesIn += size;
@@ -544,7 +627,7 @@ bool IncrementClient(std::shared_ptr<lacewing::relayserver::client> client, size
 	}
 	return true;
 }
-void OnPeerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnPeerMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	std::shared_ptr<lacewing::relayserver::channel> viachannel, std::shared_ptr<lacewing::relayserver::client> receiverclient,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant)
 {
@@ -570,7 +653,7 @@ void OnPeerMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::rela
 	server.clientmessage_permit(senderclient, viachannel, receiverclient, blasted, subchannel, data, variant, true);
 }
 
-void OnChannelMessage(lacewing::relayserver &server, std::shared_ptr<lacewing::relayserver::client> senderclient,
+void OnChannelMessage(lacewing::relayserver& server, std::shared_ptr<lacewing::relayserver::client> senderclient,
 	std::shared_ptr<lacewing::relayserver::channel> channel,
 	bool blasted, lw_ui8 subchannel, std::string_view data, lw_ui8 variant)
 {
@@ -650,7 +733,7 @@ void GenerateFlashPolicy(int port)
 		return;
 	}
 
-	FILE * forWriting = fopen(filename.c_str(), "wb");
+	FILE* forWriting = fopen(filename.c_str(), "wb");
 	if (forWriting == NULL)
 	{
 		std::cout << "Flash policy couldn't be created. Opening file "sv << filename << " for writing in current app folder failed.\r\n"sv;
